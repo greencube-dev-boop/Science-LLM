@@ -1,0 +1,55 @@
+# Python cache & build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+
+# Google Colab & Local Google Drive caches
+drive/
+.colab/
+
+# Large Model Weights, Adapters, and Datasets (These stay in Google Drive / Hugging Face)
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.gguf
+*.h5
+checkpoints/
+checkpoint-*/
+models/
+tokenized_science_blocks/
+raw_science_docs/
+*.jsonl
+
+# Environment variables & secrets
+.env
+.env.*
+secrets.json
