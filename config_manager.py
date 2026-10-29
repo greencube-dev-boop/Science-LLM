@@ -11,12 +11,42 @@ import os
 import json
 import time
 import shutil
+import inspect
 import logging
 from typing import Dict, Any, Optional, List
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("ConfigManager")
+
+
+def create_training_args(**kwargs):
+    """
+    Creates a transformers.TrainingArguments instance compatible across all transformers versions.
+    - Handles warmup_ratio -> warmup_steps migration in transformers v5+.
+    - Handles evaluation_strategy -> eval_strategy migration.
+    - Filters unsupported kwargs to prevent TypeErrors across varying library versions.
+    """
+    from transformers import TrainingArguments
+
+    sig = inspect.signature(TrainingArguments.__init__)
+    valid_params = set(sig.parameters.keys())
+
+    # Handle warmup_ratio deprecation in transformers v5+
+    if "warmup_ratio" in kwargs and "warmup_ratio" not in valid_params:
+        ratio = kwargs.pop("warmup_ratio")
+        if "warmup_steps" in valid_params and "warmup_steps" not in kwargs:
+            kwargs["warmup_steps"] = ratio
+
+    # Handle evaluation_strategy -> eval_strategy migration
+    if "evaluation_strategy" in kwargs and "evaluation_strategy" not in valid_params:
+        strat = kwargs.pop("evaluation_strategy")
+        if "eval_strategy" in valid_params:
+            kwargs["eval_strategy"] = strat
+
+    # Filter to only valid kwargs
+    filtered = {k: v for k, v in kwargs.items() if k in valid_params}
+    return TrainingArguments(**filtered)
 
 
 class ScienceLLMConfig:
@@ -26,7 +56,6 @@ class ScienceLLMConfig:
     DEFAULT_LOCAL_BASE = "./drive/Science LLM"
 
     def __init__(self, base_dir: Optional[str] = None, version: str = "1.0.0"):
-        # Detect environment: if running in Colab with mounted drive, use Colab base
         if base_dir:
             self.base_dir = Path(base_dir)
         elif os.path.exists("/content/drive/MyDrive"):
@@ -34,11 +63,6 @@ class ScienceLLMConfig:
         else:
             self.base_dir = Path(self.DEFAULT_LOCAL_BASE)
 
-        # Explicit directory requirements:
-        # PDFs and text files: drive/Science LLM/ Dataset
-        # Checkpoints: drive/Science LLM/ checkpoints
-        # Trained model: drive/Science LLM/ models with name SCLLM-v<version number>
-        # Config & data.json: drive/Science LLM/ config
         self.dataset_dir = self.base_dir / "Dataset"
         self.checkpoints_dir = self.base_dir / "checkpoints"
         self.models_dir = self.base_dir / "models"
@@ -150,7 +174,6 @@ class ScienceLLMConfig:
             if stage is None or ck_info.get("latest_stage") == stage:
                 return latest_path
 
-        # Inspect disk under checkpoints_dir if not found in state
         target_dir = self.checkpoints_dir / (stage if stage else "")
         if target_dir.exists():
             checkpoints = [
@@ -158,7 +181,6 @@ class ScienceLLMConfig:
                 if d.is_dir()
             ]
             if checkpoints:
-                # Sort by step number
                 def extract_step(p):
                     try:
                         return int(p.name.split("-")[-1])
@@ -190,13 +212,3 @@ class ScienceLLMConfig:
         self.state["evaluation_benchmarks"]["latest_eval_time"] = record["timestamp"]
         self.state["evaluation_benchmarks"]["test_results"].append(record)
         self.save_state()
-
-
-if __name__ == "__main__":
-    cfg = ScienceLLMConfig()
-    print("Initialized ScienceLLMConfig:")
-    print(f"Dataset Dir:     {cfg.dataset_dir}")
-    print(f"Checkpoints Dir: {cfg.checkpoints_dir}")
-    print(f"Models Dir:      {cfg.models_dir}")
-    print(f"Config File:     {cfg.data_json_path}")
-    print(f"Model Save Tag:  {cfg.get_model_save_dir()}")

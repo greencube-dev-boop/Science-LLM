@@ -11,20 +11,26 @@ Paths:
 
 import os
 import time
-import torch
 import logging
 from typing import Optional
+
+# Ensure unsloth is imported first if present
+try:
+    import unsloth
+except Exception:
+    pass
+
+import torch
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
-    TrainingArguments,
     TrainerCallback
 )
 from peft import PeftModel, LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from datasets import load_dataset
 from trl import SFTTrainer, DataCollatorForCompletionOnlyLM
-from config_manager import ScienceLLMConfig
+from config_manager import ScienceLLMConfig, create_training_args
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("TrainSFT")
@@ -118,7 +124,7 @@ def train_sft(cfg: ScienceLLMConfig, base_model_name: str = "Qwen/Qwen2.5-3B", e
     response_template = "<|im_start|>assistant\n"
     collator = DataCollatorForCompletionOnlyLM(response_template=response_template, tokenizer=tokenizer)
 
-    training_args = TrainingArguments(
+    training_args = create_training_args(
         output_dir=output_dir,
         per_device_train_batch_size=batch_size,
         gradient_accumulation_steps=grad_accum,

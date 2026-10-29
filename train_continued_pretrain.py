@@ -12,20 +12,29 @@ Paths:
 import os
 import sys
 import time
-import torch
 import logging
+
+# Ensure unsloth is imported before transformers/peft to apply memory optimizations cleanly
+HAS_UNSLOTH = False
+try:
+    import unsloth
+    from unsloth import FastLanguageModel
+    HAS_UNSLOTH = True
+except Exception:
+    HAS_UNSLOTH = False
+
+import torch
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
-    TrainingArguments,
     Trainer,
     TrainerCallback,
     DataCollatorForLanguageModeling
 )
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from datasets import load_from_disk, load_dataset
-from config_manager import ScienceLLMConfig
+from config_manager import ScienceLLMConfig, create_training_args
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("TrainDAPT")
@@ -53,15 +62,11 @@ class CheckpointSyncCallback(TrainerCallback):
 
 
 def is_unsloth_available() -> bool:
-    try:
-        import unsloth
-        return True
-    except ImportError:
-        return False
+    global HAS_UNSLOTH
+    return HAS_UNSLOTH
 
 
 def run_training_unsloth(cfg: ScienceLLMConfig, model_name: str, max_seq_length: int = 2048, epochs: int = 1, batch_size: int = 2, grad_accum: int = 8, lr: float = 1e-4):
-    from unsloth import FastLanguageModel
     from trl import SFTTrainer
 
     output_dir = str(cfg.checkpoints_dir / "stage1_dapt")
@@ -94,7 +99,7 @@ def run_training_unsloth(cfg: ScienceLLMConfig, model_name: str, max_seq_length:
         logger.info(f"No local blocks found. Falling back to SciQ science dataset...")
         train_dataset = load_dataset("sciq", split="train[:5000]")
 
-    training_args = TrainingArguments(
+    training_args = create_training_args(
         output_dir=output_dir,
         per_device_train_batch_size=batch_size,
         gradient_accumulation_steps=grad_accum,
@@ -189,7 +194,7 @@ def run_training_standard_peft(cfg: ScienceLLMConfig, model_name: str, epochs: i
         raw = load_dataset("sciq", split="train[:5000]")
         train_dataset = raw.map(lambda x: {"text": f"Topic: {x['question']}\nDetails: {x['support']}\nAnswer: {x['correct_answer']}"})
 
-    training_args = TrainingArguments(
+    training_args = create_training_args(
         output_dir=output_dir,
         per_device_train_batch_size=batch_size,
         gradient_accumulation_steps=grad_accum,
