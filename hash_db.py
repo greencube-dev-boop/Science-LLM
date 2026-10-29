@@ -1,11 +1,13 @@
 """
 Hash Database & Deduplication Manager for Science LLM
 ======================================================
-Maintains a persistent SHA-256 hash database in `drive/Science LLM/config/hash_db.json`
-to guarantee zero duplicate downloads across runs and mirrors.
+Maintains persistent SHA-256 content hashes and normalized metadata indexes
+in `drive/Science LLM/config/hash_db.json` to guarantee zero redundant downloads
+across mirrors, different URLs, or multiple harvest runs.
 """
 
 import os
+import re
 import json
 import time
 import shutil
@@ -21,7 +23,7 @@ logger = logging.getLogger("HashDB")
 
 
 class HashDatabase:
-    """Tracks SHA-256 content hashes and URL history to eliminate duplicate files."""
+    """Tracks SHA-256 content hashes and normalized title hashes to eliminate duplicates."""
 
     def __init__(self, config: Optional[ScienceLLMConfig] = None):
         self.config = config or ScienceLLMConfig()
@@ -34,6 +36,8 @@ class HashDatabase:
             try:
                 with open(self.db_path, "r", encoding="utf-8") as f:
                     db = json.load(f)
+                    if "seen_titles" not in db:
+                        db["seen_titles"] = []
                     logger.info(f"Loaded Hash Database: {len(db.get('hashes', {}))} unique hashes recorded.")
                     return db
             except Exception as e:
@@ -44,8 +48,9 @@ class HashDatabase:
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "last_updated": time.strftime("%Y-%m-%d %H:%M:%S"),
             "total_unique_files": 0,
-            "hashes": {},       # sha256 -> metadata
-            "seen_urls": []     # list of processed URLs
+            "hashes": {},         # sha256 -> metadata
+            "seen_urls": [],       # list of processed URLs
+            "seen_titles": []      # normalized title hashes for cross-mirror deduplication
         }
         self.save_db(initial_db)
         return initial_db
@@ -71,9 +76,20 @@ class HashDatabase:
                 hasher.update(chunk)
         return hasher.hexdigest()
 
+    @staticmethod
+    def normalize_title(title: str) -> str:
+        """Normalizes publication title for fuzzy/cross-mirror deduplication."""
+        cleaned = re.sub(r"[^a-zA-Z0-9]", "", title.lower())
+        return hashlib.md5(cleaned.encode("utf-8")).hexdigest() if cleaned else ""
+
     def is_url_seen(self, url: str) -> bool:
         """Checks if a URL has already been queued or downloaded."""
         return url in self.data.get("seen_urls", [])
+
+    def is_title_seen(self, title: str) -> bool:
+        """Checks if a publication title has already been ingested from another source."""
+        norm = self.normalize_title(title)
+        return norm in self.data.get("seen_titles", []) if norm else False
 
     def is_hash_known(self, sha256: str) -> bool:
         """Checks if content hash is already in the database."""
@@ -98,11 +114,20 @@ class HashDatabase:
 
         if self.is_hash_known(file_sha256):
             existing_info = self.data["hashes"][file_sha256]
-            logger.info(f"Duplicate detected: {file_path.name} has identical SHA-256 as {existing_info.get('filename')}. Removing duplicate.")
+            logger.info(f"Duplicate content detected: {file_path.name} matches {existing_info.get('filename')}. Removing.")
             try:
                 file_path.unlink()
             except Exception as e:
                 logger.warning(f"Failed to remove duplicate file: {e}")
+            return False
+
+        norm_title = self.normalize_title(title) if title else ""
+        if norm_title and norm_title in self.data.get("seen_titles", []):
+            logger.info(f"Duplicate title detected: '{title}'. Removing mirror file.")
+            try:
+                file_path.unlink()
+            except Exception as e:
+                logger.warning(f"Failed to remove duplicate title file: {e}")
             return False
 
         # Register unique file
@@ -121,6 +146,8 @@ class HashDatabase:
 
         if source_url and source_url not in self.data["seen_urls"]:
             self.data["seen_urls"].append(source_url)
+        if norm_title and norm_title not in self.data["seen_titles"]:
+            self.data["seen_titles"].append(norm_title)
 
         self.save_db()
         return True

@@ -2,18 +2,17 @@
 Data Engineering Pipeline for Science Domain LLM
 ================================================
 Handles:
-1. Automated PDF downloading from: drive/Science LLM/down.txt into drive/Science LLM/Dataset.
-2. Tag-based discovery and harvesting via ScienceHarvester.
-3. PDF to TXT batch conversion with formula preservation.
-4. Sequence packing into token blocks (2048 context length).
-5. Synchronizing dataset stats into drive/Science LLM/config/data.json.
+1. Ingesting converted scientific texts from `Dataset/extracted_texts/`.
+2. Generator-based low-memory sequence packing into 2048-token blocks.
+3. Document boundary demarcation using model-specific EOS / end-of-text tokens.
+4. Synchronizing dataset statistics and token metrics into `data.json`.
 """
 
 import os
 import re
 import json
 import logging
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Generator
 from pathlib import Path
 
 from config_manager import ScienceLLMConfig
@@ -30,61 +29,6 @@ def download_pdfs_from_list(config: Optional[ScienceLLMConfig] = None, down_file
     cfg = config or ScienceLLMConfig()
     dl = PDFDownloader(config=cfg)
     return dl.process_down_txt(down_txt_path=down_file)
-
-
-class ScienceTextExtractor:
-    """Extracts and sanitizes text from scientific PDFs, books, and articles."""
-
-    @staticmethod
-    def extract_text_from_pdf(pdf_path: str) -> str:
-        """
-        Extracts clean text from a scientific PDF using PyMuPDF (fitz),
-        respecting multi-column reading order and extracting block structures.
-        """
-        try:
-            import fitz  # PyMuPDF
-        except ImportError:
-            raise ImportError("PyMuPDF is required for PDF extraction. Install via: pip install pymupdf")
-
-        if not os.path.exists(pdf_path):
-            raise FileNotFoundError(f"PDF not found at: {pdf_path}")
-
-        doc = fitz.open(pdf_path)
-        full_text = []
-
-        for page_num in range(len(doc)):
-            page = doc[page_num]
-            blocks = page.get_text("blocks")
-            page_content = []
-
-            for b in blocks:
-                if b[6] == 0:  # Text block
-                    text_block = b[4].strip()
-                    if text_block:
-                        page_content.append(text_block)
-
-            full_text.append("\n\n".join(page_content))
-
-        raw_document = "\n\n".join(full_text)
-        return ScienceTextExtractor.clean_scientific_text(raw_document)
-
-    @staticmethod
-    def clean_scientific_text(text: str) -> str:
-        """Cleans noise while preserving mathematical and scientific notation."""
-        text = text.replace("\r\n", "\n").replace("\r", "\n")
-        text = re.sub(r"\n\s*\d+\s*\n", "\n", text)
-        text = re.sub(r"arXiv:\d{4}\.\d{4,5}v\d+\s+\[.*?\]\s+\d+\s+\w+\s+\d{4}", "", text)
-        text = re.sub(r"doi:\s*10\.\d{4,9}/[-._;()/:A-Z0-9]+", "", text, flags=re.IGNORECASE)
-        text = re.sub(r"https?://\S+", "", text)
-
-        # Truncate at standard Bibliography / References section
-        ref_match = re.search(r"\n\s*(?:REFERENCES|References|BIBLIOGRAPHY|Bibliography)\s*\n", text)
-        if ref_match:
-            text = text[:ref_match.start()]
-
-        text = re.sub(r"\n{3,}", "\n\n", text)
-        text = re.sub(r"[ \t]+", " ", text)
-        return text.strip()
 
 
 class DatasetBuilder:
@@ -111,14 +55,14 @@ class DatasetBuilder:
 
         logger.info(f"Scanning for pre-converted text files and PDFs in: {input_path}")
         with open(out_file, "w", encoding="utf-8") as out_f:
-            # Check extracted_texts first for blazing fast text loading
+            # Check extracted_texts first for fast text loading
             txt_files = list(input_path.glob("extracted_texts/*.txt")) + [
                 f for f in input_path.glob("*.txt") if "extracted_texts" not in str(f)
             ]
             for file_path in txt_files:
                 try:
                     with open(file_path, "r", encoding="utf-8", errors="ignore") as in_f:
-                        text = in_f.read()
+                        text = in_f.read().strip()
                         if len(text) > 200:
                             out_f.write(json.dumps({"text": text, "source": file_path.name}) + "\n")
                             records_count += 1
@@ -128,13 +72,17 @@ class DatasetBuilder:
 
             # If no extracted txt files, fallback to direct PDF parsing
             if records_count == 0:
+                converter = PDFToTextConverter(config=self.config)
                 for file_path in input_path.glob("*.pdf"):
                     try:
-                        text = ScienceTextExtractor.extract_text_from_pdf(str(file_path))
-                        if len(text) > 200:
-                            out_f.write(json.dumps({"text": text, "source": file_path.name}) + "\n")
-                            records_count += 1
-                            total_chars += len(text)
+                        extracted = converter.convert_single_pdf(file_path)
+                        if extracted and extracted.exists():
+                            with open(extracted, "r", encoding="utf-8", errors="ignore") as in_f:
+                                text = in_f.read().strip()
+                                if len(text) > 200:
+                                    out_f.write(json.dumps({"text": text, "source": file_path.name}) + "\n")
+                                    records_count += 1
+                                    total_chars += len(text)
                     except Exception as e:
                         logger.warning(f"Failed to process {file_path.name}: {e}")
 
@@ -142,7 +90,10 @@ class DatasetBuilder:
         return records_count
 
     def pack_sequences_for_dapt(self, input_jsonl: Optional[str] = None, output_tokenized_path: Optional[str] = None):
-        """Packs corpus into fixed-length token blocks and logs stats into data.json."""
+        """
+        Packs corpus into fixed-length token blocks with boundary markers (<|endoftext|>).
+        Uses streaming batch generation to minimize RAM footprint.
+        """
         from datasets import Dataset
 
         in_file = Path(input_jsonl) if input_jsonl else self.config.dataset_dir / "processed_science_corpus.jsonl"
@@ -152,37 +103,36 @@ class DatasetBuilder:
             logger.warning(f"Processed corpus not found at {in_file}")
             return None
 
-        logger.info("Packing sequences into fixed token blocks...")
-        all_token_ids: List[int] = []
+        eos_id = self.tokenizer.eos_token_id
+        seq_len = self.max_seq_length
 
-        with open(in_file, "r", encoding="utf-8") as f:
-            for line in f:
-                data = json.loads(line)
-                text = data.get("text", "")
-                if text:
-                    tokens = self.tokenizer.encode(text, add_special_tokens=False)
-                    tokens.append(self.tokenizer.eos_token_id)
-                    all_token_ids.extend(tokens)
+        def token_block_generator() -> Generator[Dict[str, List[int]], None, None]:
+            buffer: List[int] = []
+            with open(in_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    data = json.loads(line)
+                    text = data.get("text", "")
+                    if text:
+                        tokens = self.tokenizer.encode(text, add_special_tokens=False)
+                        tokens.append(eos_id)
+                        buffer.extend(tokens)
 
-        total_tokens = len(all_token_ids)
-        num_blocks = total_tokens // self.max_seq_length
-        logger.info(f"Total tokens: {total_tokens:,}. Creating {num_blocks:,} packed blocks of length {self.max_seq_length}.")
+                        while len(buffer) >= seq_len:
+                            block = buffer[:seq_len]
+                            buffer = buffer[seq_len:]
+                            yield {"input_ids": block, "labels": list(block)}
 
-        packed_blocks = []
-        for i in range(num_blocks):
-            start_idx = i * self.max_seq_length
-            end_idx = start_idx + self.max_seq_length
-            block = all_token_ids[start_idx:end_idx]
-            packed_blocks.append({"input_ids": block, "labels": list(block)})
-
-        dataset = Dataset.from_list(packed_blocks)
+        logger.info("Packing sequences via generator into token blocks...")
+        dataset = Dataset.from_generator(token_block_generator)
         dataset.save_to_disk(str(out_dir))
-        logger.info(f"Saved packed dataset ({len(dataset)} examples) to {out_dir}")
+
+        total_tokens = len(dataset) * seq_len
+        logger.info(f"Saved packed dataset ({len(dataset):,} blocks = ~{total_tokens:,} tokens) to {out_dir}")
 
         self.config.state["dataset_stats"] = {
             "total_tokens": total_tokens,
-            "packed_blocks": num_blocks,
-            "block_size": self.max_seq_length,
+            "packed_blocks": len(dataset),
+            "block_size": seq_len,
             "dataset_path": str(out_dir)
         }
         self.config.save_state()

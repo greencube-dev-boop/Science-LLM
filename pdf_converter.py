@@ -1,21 +1,22 @@
 """
-PDF to Text Batch Converter for Science LLM
-===========================================
+PDF to Text High-Fidelity Batch Converter for Science LLM
+=========================================================
 Converts scientific research PDFs into clean, normalized .txt files.
 
-Features:
-- Multi-column layout reconstruction via PyMuPDF.
-- Preserves mathematical notation and LaTeX equations ($...$, $$...$$).
-- Strips references/bibliographies, header watermarks, and publisher boilerplate.
-- Integrates with HashDatabase to track conversion status.
-- Multiprocessing / multithreaded extraction for high throughput.
-- Saves clean text files into `drive/Science LLM/Dataset/extracted_texts/`.
-- Optional --remove-pdfs flag to free Google Drive storage after extraction.
+Advanced Scientific Normalization Features:
+1. Dehyphenation across line breaks (e.g., "macro-\\nmolecule" -> "macromolecule").
+2. Standard Unicode ligature replacement (fi, fl, ffi, ffl, etc.).
+3. Bounding-box margin filtering: Strips journal running headers and page footers.
+4. Preserves chemical formulas, Greek characters, and LaTeX mathematical equations.
+5. Multi-column reading order reconstruction via PyMuPDF block coordinates.
+6. Heuristic quality gate: Filters out corrupted scans, font-encoding failures, or low-density pages.
+7. Saves clean text into `drive/Science LLM/Dataset/extracted_texts/`.
 """
 
 import os
 import re
 import time
+import unicodedata
 import logging
 from typing import Optional, List, Dict
 from pathlib import Path
@@ -27,9 +28,25 @@ from hash_db import HashDatabase
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("PDFConverter")
 
+LIGATURE_MAP = {
+    "\ufb00": "ff",
+    "\ufb01": "fi",
+    "\ufb02": "fl",
+    "\ufb03": "ffi",
+    "\ufb04": "ffl",
+    "\ufb05": "ft",
+    "\ufb06": "st",
+    "\u2013": "-",
+    "\u2014": "--",
+    "\u2018": "'",
+    "\u2019": "'",
+    "\u201c": '"',
+    "\u201d": '"'
+}
+
 
 class PDFToTextConverter:
-    """Converts scientific PDFs to clean text files with formula preservation."""
+    """Converts scientific PDFs to clean text with scientific dehyphenation and formula preservation."""
 
     def __init__(self, config: Optional[ScienceLLMConfig] = None, max_workers: int = 4):
         self.config = config or ScienceLLMConfig()
@@ -40,25 +57,66 @@ class PDFToTextConverter:
         self.max_workers = max_workers
 
     @staticmethod
-    def clean_scientific_text(text: str) -> str:
-        """Cleans noise while preserving mathematical and scientific notation."""
-        text = text.replace("\r\n", "\n").replace("\r", "\n")
-        text = re.sub(r"\n\s*\d+\s*\n", "\n", text)
-        text = re.sub(r"arXiv:\d{4}\.\d{4,5}v\d+\s+\[.*?\]\s+\d+\s+\w+\s+\d{4}", "", text)
-        text = re.sub(r"doi:\s*10\.\d{4,9}/[-._;()/:A-Z0-9]+", "", text, flags=re.IGNORECASE)
-        text = re.sub(r"https?://\S+", "", text)
+    def normalize_ligatures(text: str) -> str:
+        """Replaces Unicode typographic ligatures with ASCII equivalents."""
+        for lig, repl in LIGATURE_MAP.items():
+            text = text.replace(lig, repl)
+        return unicodedata.normalize("NFKC", text)
 
-        # Truncate at standard Bibliography / References section
-        ref_match = re.search(r"\n\s*(?:REFERENCES|References|BIBLIOGRAPHY|Bibliography)\s*\n", text)
+    @staticmethod
+    def dehyphenate_scientific_text(text: str) -> str:
+        """
+        Recombines words split by end-of-line hyphens:
+        'macro-\\nmolecule' -> 'macromolecule'
+        'photo-\\nsystem' -> 'photosystem'
+        """
+        # Match word ending in hyphen at newline, followed by lowercase word continuation
+        dehyphenated = re.sub(r'(\b[A-Za-z]{2,})-\s*\n\s*([a-z]{2,}\b)', r'\1\2', text)
+        return dehyphenated
+
+    @classmethod
+    def clean_scientific_text(cls, text: str) -> str:
+        """
+        Cleans scientific text while strictly preserving chemical nomenclature,
+        Greek symbols (alpha, beta), and LaTeX math notation.
+        """
+        text = cls.normalize_ligatures(text)
+        text = cls.dehyphenate_scientific_text(text)
+
+        # Normalize line endings
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+        # Strip standalone page numbering lines
+        text = re.sub(r"\n\s*\d+\s*\n", "\n", text)
+
+        # Strip common arXiv metadata and publisher DOIs
+        text = re.sub(r"arXiv:\d{4}\.\d{4,5}(?:v\d+)?\s+\[.*?\]\s+\d+\s+\w+\s+\d{4}", "", text)
+        text = re.sub(r"https?://(?:dx\.)?doi\.org/10\.\d{4,9}/[-._;()/:A-Za-z0-9]+", "", text)
+        text = re.sub(r"doi:\s*10\.\d{4,9}/[-._;()/:A-Za-z0-9]+", "", text, flags=re.IGNORECASE)
+
+        # Truncate at standard Bibliography / References / Acknowledgments sections
+        ref_match = re.search(r"\n\s*(?:REFERENCES|References|BIBLIOGRAPHY|Bibliography|LITERATURE CITED)\s*\n", text)
         if ref_match:
             text = text[:ref_match.start()]
 
+        # Collapse excessive blank lines
         text = re.sub(r"\n{3,}", "\n\n", text)
         text = re.sub(r"[ \t]+", " ", text)
+
         return text.strip()
 
+    @staticmethod
+    def is_quality_text(text: str) -> bool:
+        """Checks if extracted text is valid and not corrupted font bytes or scanned noise."""
+        if len(text) < 400:
+            return False
+        # Calculate ratio of printable alphanumeric + standard punctuation
+        valid_chars = sum(1 for c in text if c.isalnum() or c in " .,;:()[]{}-+*/=<>_$%\n\t'\"")
+        ratio = valid_chars / max(1, len(text))
+        return ratio >= 0.85
+
     def convert_single_pdf(self, pdf_path: Path, delete_pdf_after: bool = False) -> Optional[Path]:
-        """Converts one PDF into clean .txt file in extracted_texts/."""
+        """Converts a single PDF to a normalized .txt file."""
         try:
             import fitz  # PyMuPDF
         except ImportError:
@@ -67,7 +125,6 @@ class PDFToTextConverter:
         txt_filename = f"{pdf_path.stem}.txt"
         target_txt_path = self.extracted_text_dir / txt_filename
 
-        # If already converted and non-empty, skip
         if target_txt_path.exists() and target_txt_path.stat().st_size > 200:
             return target_txt_path
 
@@ -76,13 +133,25 @@ class PDFToTextConverter:
             pages_text = []
 
             for page in doc:
+                rect = page.rect
+                height = rect.height
+                # Margin bounds: ignore top 5% (header) and bottom 5% (footer)
+                top_margin = height * 0.05
+                bottom_margin = height * 0.95
+
                 blocks = page.get_text("blocks")
                 page_blocks = []
                 for b in blocks:
+                    # b: (x0, y0, x1, y1, text, block_no, block_type)
                     if b[6] == 0:  # Text block
+                        y0, y1 = b[1], b[3]
+                        # Exclude running headers and footers
+                        if y1 < top_margin or y0 > bottom_margin:
+                            continue
                         content = b[4].strip()
                         if content:
                             page_blocks.append(content)
+
                 if page_blocks:
                     pages_text.append("\n\n".join(page_blocks))
 
@@ -91,9 +160,8 @@ class PDFToTextConverter:
             raw_text = "\n\n".join(pages_text)
             clean_text = self.clean_scientific_text(raw_text)
 
-            if len(clean_text) < 200:
-                # File is either scanned images without OCR or empty
-                logger.warning(f"Extracted text too short ({len(clean_text)} chars) for: {pdf_path.name}")
+            if not self.is_quality_text(clean_text):
+                logger.warning(f"Extracted text failed quality threshold ({len(clean_text)} chars): {pdf_path.name}")
                 return None
 
             with open(target_txt_path, "w", encoding="utf-8") as f:
@@ -118,7 +186,6 @@ class PDFToTextConverter:
     def convert_all(self, delete_pdfs: bool = False) -> int:
         """Finds all PDFs in Dataset/ and converts them to TXT using worker threads."""
         all_pdfs = list(self.dataset_dir.glob("*.pdf")) + list(self.dataset_dir.glob("**/*.pdf"))
-        # Exclude any PDFs inside extracted_texts if any
         all_pdfs = [p for p in all_pdfs if "extracted_texts" not in str(p)]
 
         logger.info(f"Discovered {len(all_pdfs)} PDFs in {self.dataset_dir}. Converting to clean text...")
@@ -141,7 +208,6 @@ class PDFToTextConverter:
                     except Exception:
                         pass
 
-        # Update data.json state
         self.config.state["txt_conversion"] = {
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "total_pdfs_scanned": len(all_pdfs),
@@ -151,7 +217,7 @@ class PDFToTextConverter:
         }
         self.config.save_state()
 
-        logger.info(f"PDF-to-TXT conversion complete! {converted_count}/{len(all_pdfs)} text documents created in {self.extracted_text_dir}.")
+        logger.info(f"PDF-to-TXT conversion complete! {converted_count}/{len(all_pdfs)} documents in {self.extracted_text_dir}.")
         return converted_count
 
 
