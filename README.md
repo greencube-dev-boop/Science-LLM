@@ -10,14 +10,15 @@ All persistent training data, checkpoints, models, and metadata are automaticall
 
 ```
 drive/MyDrive/Science LLM/
-├── down.txt                 # (Optional) Text file with one PDF download link per line
+├── down.txt                 # (Optional) Text file with custom PDF download links
 │
-├── Dataset/                 # Input PDFs, research papers, textbooks, and text files (.pdf, .txt, .md)
+├── Dataset/                 # Downloaded PDFs and textbooks
+│   ├── extracted_texts/     # Pre-converted clean .txt files with formulas preserved
 │   ├── processed_science_corpus.jsonl
 │   └── tokenized_science_blocks/
 │
 ├── checkpoints/             # Saved training steps & adapters
-│   ├── stage1_dapt/         # Stage 1 Continued Pre-Training checkpoints (e.g. checkpoint-100, checkpoint-200)
+│   ├── stage1_dapt/         # Stage 1 Continued Pre-Training checkpoints
 │   │   └── final_dapt_adapter/
 │   └── stage2_sft/          # Stage 2 Supervised Fine-Tuning checkpoints
 │       └── final_sft_adapter/
@@ -27,29 +28,41 @@ drive/MyDrive/Science LLM/
 │   └── SCLLM-v1.1.0/
 │
 └── config/                  # State tracking, restart/resume data, and evaluation logs
-    └── data.json            # Central metadata file
+    ├── data.json            # Central experiment & run metadata tracker
+    └── hash_db.json         # SHA-256 database for zero-duplicate storage
 ```
 
 ---
 
-## 📥 Automated PDF Downloading (`down.txt`)
+## 🔬 Science Paper & Book Harvester (`science_harvester.py`)
 
-You can create a `down.txt` file directly inside `drive/MyDrive/Science LLM/down.txt` containing one download URL per line:
-```text
-https://arxiv.org/pdf/1706.03762.pdf
-https://openstax.org/downloads/college-physics.pdf
-https://www.ncbi.nlm.nih.gov/pmc/articles/PMC1234567/pdf/main.pdf
+Harvests 1,000 to 5,000+ open-access research papers and books directly from **Europe PMC** and **arXiv** using domain tags:
+- **Default Tags**: `organic chemistry`, `biochemistry`, `botany`, `plant biology`, `chemistry`, `biology`
+- **SHA-256 Deduplication**: Every file's content hash is recorded in `drive/MyDrive/Science LLM/config/hash_db.json`. Any duplicate paper or mirror is automatically identified and removed.
+- **Header Verification**: Ensures every file contains valid `%PDF` binary magic bytes.
+
+CLI execution:
+```bash
+python science_harvester.py --limit 1000 --tags "organic chemistry" "biochemistry" "botany" "plant biology" "chemistry" "biology"
 ```
 
-The pipeline automatically:
-1. Streams each file into `drive/MyDrive/Science LLM/Dataset/`.
-2. Validates the `%PDF` magic byte header (preventing paywall HTML pages from being saved as corrupted PDFs).
-3. Skips already downloaded files to conserve bandwidth.
-4. Records download metrics into `drive/MyDrive/Science LLM/config/data.json`.
+---
 
-You can also run the downloader standalone:
+## 📄 PDF to Clean Text Batch Converter (`pdf_converter.py`)
+
+Converting PDFs into text ahead of time provides 50x–100x faster tokenization and eliminates runtime memory spikes:
+- Multi-column layout reconstruction via PyMuPDF.
+- Preserves inline and display mathematical formulas (`$...$`, `$$...$$`).
+- Truncates bibliographies/reference lists and removes publisher header noise.
+- Outputs clean text to `drive/MyDrive/Science LLM/Dataset/extracted_texts/`.
+
+CLI execution:
 ```bash
-python downloader.py --down_file "/content/drive/MyDrive/Science LLM/down.txt"
+# Convert all PDFs to TXT (keep PDFs)
+python pdf_converter.py --workers 4
+
+# Or convert and delete raw PDFs to save Google Drive storage:
+python pdf_converter.py --workers 4 --delete_pdfs
 ```
 
 ---
@@ -58,7 +71,8 @@ python downloader.py --down_file "/content/drive/MyDrive/Science LLM/down.txt"
 
 The [`config_manager.py`](file:///d:/code/LLM/config_manager.py) module manages `data.json` with atomic writes, recording:
 - **Active Model Version**: `SCLLM-v<version>` (e.g., `SCLLM-v1.0.0`).
-- **Download Records**: Total URLs found and successfully downloaded from `down.txt`.
+- **Harvesting Logs**: Number of papers fetched per domain tag.
+- **Conversion Stats**: Total PDFs scanned and converted into clean text.
 - **Checkpoints & Resumption**: Latest checkpoint step, stage, directory path, and `can_resume` flag to automatically restart from the exact step if Colab times out.
 - **Training Runs**: Start/end timestamps, duration, loss, hyperparameters (batch size, learning rate, gradient accumulation).
 - **Evaluation Benchmarks**: Test prompts, domain tags, generated responses, and benchmark evaluation history.
@@ -67,13 +81,16 @@ The [`config_manager.py`](file:///d:/code/LLM/config_manager.py) module manages 
 
 ## 🛠️ Repository Files
 
-- [`downloader.py`](file:///d:/code/LLM/downloader.py): Stream downloader with URL parsing, `%PDF` verification, and duplicate skipping.
+- [`science_harvester.py`](file:///d:/code/LLM/science_harvester.py): Open scientific paper downloader querying Europe PMC & arXiv by tags with multithreading.
+- [`hash_db.py`](file:///d:/code/LLM/hash_db.py): SHA-256 content deduplication manager.
+- [`pdf_converter.py`](file:///d:/code/LLM/pdf_converter.py): Fast batch PDF-to-TXT converter with formula preservation.
+- [`downloader.py`](file:///d:/code/LLM/downloader.py): Stream downloader for custom links in `down.txt`.
 - [`config_manager.py`](file:///d:/code/LLM/config_manager.py): Central configuration manager for paths, versions, and atomic `data.json` synchronization.
-- [`data_pipeline.py`](file:///d:/code/LLM/data_pipeline.py): Multi-column PDF parsing (PyMuPDF `fitz`), LaTeX formula preservation, reference trimming, and token chunk packing.
+- [`data_pipeline.py`](file:///d:/code/LLM/data_pipeline.py): Token chunk packer prioritizing pre-converted text files.
 - [`train_continued_pretrain.py`](file:///d:/code/LLM/train_continued_pretrain.py): Stage 1 Domain-Adaptive Continued Pre-Training with Unsloth / QLoRA 4-bit and auto-resume callback.
 - [`train_sft.py`](file:///d:/code/LLM/train_sft.py): Stage 2 Supervised Fine-Tuning with ChatML prompt formatting and assistant completion masking.
 - [`export_and_evaluate.py`](file:///d:/code/LLM/export_and_evaluate.py): Merges LoRA adapters into standalone 16-bit weights at `models/SCLLM-v<version>` and logs evaluation tests.
-- [`Science_LLM_Colab_Master.ipynb`](file:///d:/code/LLM/Science_LLM_Colab_Master.ipynb): Complete end-to-end Google Colab notebook with automatic Drive mounting, resume logic, and testing.
+- [`Science_LLM_Colab_Master.ipynb`](file:///d:/code/LLM/Science_LLM_Colab_Master.ipynb): Complete end-to-end Google Colab master notebook.
 - [`requirements.txt`](file:///d:/code/LLM/requirements.txt): Pinned dependencies for T4 GPU environments.
 - [`.gitignore`](file:///d:/code/LLM/.gitignore): Excludes large model binaries, virtualenvs, and temporary files from version control.
 
@@ -82,6 +99,9 @@ The [`config_manager.py`](file:///d:/code/LLM/config_manager.py) module manages 
 ## 🚀 Quickstart in Google Colab
 
 1. Open [Google Colab](https://colab.research.google.com).
-2. Upload [`Science_LLM_Colab_Master.ipynb`](file:///d:/code/LLM/Science_LLM_Colab_Master.ipynb) or open directly from GitHub: `https://colab.research.google.com/github/greencube-dev-boop/Science-LLM/blob/main/Science_LLM_Colab_Master.ipynb`.
+2. Open [`Science_LLM_Colab_Master.ipynb`](file:///d:/code/LLM/Science_LLM_Colab_Master.ipynb) or load directly from GitHub: `https://colab.research.google.com/github/greencube-dev-boop/Science-LLM/blob/main/Science_LLM_Colab_Master.ipynb`.
 3. Set runtime to **GPU (T4)**.
-4. Run all cells sequentially.
+4. Run cells sequentially:
+   - Step 5 will harvest open papers across the science tags.
+   - Step 7 converts all PDFs to clean text.
+   - Steps 9-12 train, evaluate, and export the model to `SCLLM-v1.0.0`.

@@ -3,9 +3,9 @@ Data Engineering Pipeline for Science Domain LLM
 ================================================
 Handles:
 1. Automated PDF downloading from: drive/Science LLM/down.txt into drive/Science LLM/Dataset.
-2. Ingesting scientific PDFs and text files from: drive/Science LLM/Dataset.
-3. Cleaning, multi-column reassembly, and LaTeX formula preservation.
-4. Packing sequences into token blocks (2048 context length).
+2. Tag-based discovery and harvesting via ScienceHarvester.
+3. PDF to TXT batch conversion with formula preservation.
+4. Sequence packing into token blocks (2048 context length).
 5. Synchronizing dataset stats into drive/Science LLM/config/data.json.
 """
 
@@ -18,6 +18,8 @@ from pathlib import Path
 
 from config_manager import ScienceLLMConfig
 from downloader import PDFDownloader
+from hash_db import HashDatabase
+from pdf_converter import PDFToTextConverter
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("DataPipeline")
@@ -52,7 +54,6 @@ class ScienceTextExtractor:
 
         for page_num in range(len(doc)):
             page = doc[page_num]
-            # 'blocks' mode handles multi-column scientific layouts
             blocks = page.get_text("blocks")
             page_content = []
 
@@ -100,42 +101,44 @@ class DatasetBuilder:
 
     def process_dataset_folder(self, input_dir: Optional[str] = None, output_jsonl: Optional[str] = None) -> int:
         """
-        Reads all .pdf, .txt, and .md files in Dataset directory, extracts & cleans them,
-        and saves each document as a JSON record {'text': ...}.
+        Reads all converted .txt, .md, and remaining .pdf files in Dataset directory,
+        prioritizing fast pre-converted text files from extracted_texts/.
         """
         input_path = Path(input_dir) if input_dir else self.config.dataset_dir
         out_file = Path(output_jsonl) if output_jsonl else self.config.dataset_dir / "processed_science_corpus.jsonl"
         records_count = 0
         total_chars = 0
 
-        logger.info(f"Scanning for PDFs and text files in: {input_path}")
+        logger.info(f"Scanning for pre-converted text files and PDFs in: {input_path}")
         with open(out_file, "w", encoding="utf-8") as out_f:
-            for file_path in input_path.glob("**/*"):
-                if file_path.suffix.lower() == ".pdf":
+            # Check extracted_texts first for blazing fast text loading
+            txt_files = list(input_path.glob("extracted_texts/*.txt")) + [
+                f for f in input_path.glob("*.txt") if "extracted_texts" not in str(f)
+            ]
+            for file_path in txt_files:
+                try:
+                    with open(file_path, "r", encoding="utf-8", errors="ignore") as in_f:
+                        text = in_f.read()
+                        if len(text) > 200:
+                            out_f.write(json.dumps({"text": text, "source": file_path.name}) + "\n")
+                            records_count += 1
+                            total_chars += len(text)
+                except Exception as e:
+                    logger.warning(f"Could not read {file_path.name}: {e}")
+
+            # If no extracted txt files, fallback to direct PDF parsing
+            if records_count == 0:
+                for file_path in input_path.glob("*.pdf"):
                     try:
                         text = ScienceTextExtractor.extract_text_from_pdf(str(file_path))
                         if len(text) > 200:
                             out_f.write(json.dumps({"text": text, "source": file_path.name}) + "\n")
                             records_count += 1
                             total_chars += len(text)
-                            logger.info(f"Processed PDF: {file_path.name} ({len(text)} characters)")
                     except Exception as e:
                         logger.warning(f"Failed to process {file_path.name}: {e}")
 
-                elif file_path.suffix.lower() in [".txt", ".md"]:
-                    try:
-                        with open(file_path, "r", encoding="utf-8", errors="ignore") as in_f:
-                            text = in_f.read()
-                            clean_txt = ScienceTextExtractor.clean_scientific_text(text)
-                            if len(clean_txt) > 200:
-                                out_f.write(json.dumps({"text": clean_txt, "source": file_path.name}) + "\n")
-                                records_count += 1
-                                total_chars += len(clean_txt)
-                                logger.info(f"Processed Text: {file_path.name} ({len(clean_txt)} characters)")
-                    except Exception as e:
-                        logger.warning(f"Failed to process {file_path.name}: {e}")
-
-        logger.info(f"Extraction complete. Total records: {records_count} saved to {out_file}")
+        logger.info(f"Corpus compilation complete: {records_count} documents ({total_chars:,} characters) saved to {out_file}")
         return records_count
 
     def pack_sequences_for_dapt(self, input_jsonl: Optional[str] = None, output_tokenized_path: Optional[str] = None):
@@ -192,6 +195,7 @@ if __name__ == "__main__":
     parser.add_argument("--base_dir", type=str, default=None, help="Base Drive dir: drive/Science LLM")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-3B", help="Tokenizer model name")
     parser.add_argument("--download_first", action="store_true", help="Download links from down.txt before processing")
+    parser.add_argument("--convert_pdfs", action="store_true", help="Batch convert PDFs to clean TXT before building corpus")
     args = parser.parse_args()
 
     cfg = ScienceLLMConfig(base_dir=args.base_dir)
@@ -199,10 +203,14 @@ if __name__ == "__main__":
     if args.download_first or (cfg.base_dir / "down.txt").exists():
         download_pdfs_from_list(config=cfg)
 
+    if args.convert_pdfs:
+        conv = PDFToTextConverter(config=cfg)
+        conv.convert_all()
+
     builder = DatasetBuilder(tokenizer_name=args.model_name, max_seq_length=2048, config=cfg)
     records = builder.process_dataset_folder()
 
     if records > 0:
         builder.pack_sequences_for_dapt()
     else:
-        logger.info(f"No PDFs/text found in {cfg.dataset_dir}. Place your books/articles or down.txt in the folder.")
+        logger.info(f"No documents found in {cfg.dataset_dir}.")
