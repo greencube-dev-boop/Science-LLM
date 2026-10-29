@@ -2,10 +2,11 @@
 Data Engineering Pipeline for Science Domain LLM
 ================================================
 Handles:
-1. Ingesting scientific PDFs and text files from: drive/Science LLM/Dataset.
-2. Cleaning, multi-column reassembly, and LaTeX formula preservation.
-3. Packing sequences into token blocks (2048 context length).
-4. Synchronizing dataset stats into drive/Science LLM/config/data.json.
+1. Automated PDF downloading from: drive/Science LLM/down.txt into drive/Science LLM/Dataset.
+2. Ingesting scientific PDFs and text files from: drive/Science LLM/Dataset.
+3. Cleaning, multi-column reassembly, and LaTeX formula preservation.
+4. Packing sequences into token blocks (2048 context length).
+5. Synchronizing dataset stats into drive/Science LLM/config/data.json.
 """
 
 import os
@@ -14,10 +15,19 @@ import json
 import logging
 from typing import List, Dict, Optional
 from pathlib import Path
+
 from config_manager import ScienceLLMConfig
+from downloader import PDFDownloader
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("DataPipeline")
+
+
+def download_pdfs_from_list(config: Optional[ScienceLLMConfig] = None, down_file: Optional[str] = None) -> List[str]:
+    """Helper to check and download PDFs from down.txt to Dataset folder."""
+    cfg = config or ScienceLLMConfig()
+    dl = PDFDownloader(config=cfg)
+    return dl.process_down_txt(down_txt_path=down_file)
 
 
 class ScienceTextExtractor:
@@ -166,7 +176,6 @@ class DatasetBuilder:
         dataset.save_to_disk(str(out_dir))
         logger.info(f"Saved packed dataset ({len(dataset)} examples) to {out_dir}")
 
-        # Update data.json with dataset metrics
         self.config.state["dataset_stats"] = {
             "total_tokens": total_tokens,
             "packed_blocks": num_blocks,
@@ -182,13 +191,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Science Data Pipeline")
     parser.add_argument("--base_dir", type=str, default=None, help="Base Drive dir: drive/Science LLM")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-3B", help="Tokenizer model name")
+    parser.add_argument("--download_first", action="store_true", help="Download links from down.txt before processing")
     args = parser.parse_args()
 
     cfg = ScienceLLMConfig(base_dir=args.base_dir)
+
+    if args.download_first or (cfg.base_dir / "down.txt").exists():
+        download_pdfs_from_list(config=cfg)
+
     builder = DatasetBuilder(tokenizer_name=args.model_name, max_seq_length=2048, config=cfg)
     records = builder.process_dataset_folder()
 
     if records > 0:
         builder.pack_sequences_for_dapt()
     else:
-        logger.info(f"No PDFs/text found in {cfg.dataset_dir}. Place your books/articles in this folder.")
+        logger.info(f"No PDFs/text found in {cfg.dataset_dir}. Place your books/articles or down.txt in the folder.")

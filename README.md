@@ -10,7 +10,9 @@ All persistent training data, checkpoints, models, and metadata are automaticall
 
 ```
 drive/MyDrive/Science LLM/
-├── Dataset/                 # PDFs, research papers, textbooks, and text files (.pdf, .txt, .md)
+├── down.txt                 # (Optional) Text file with one PDF download link per line
+│
+├── Dataset/                 # Input PDFs, research papers, textbooks, and text files (.pdf, .txt, .md)
 │   ├── processed_science_corpus.jsonl
 │   └── tokenized_science_blocks/
 │
@@ -30,10 +32,33 @@ drive/MyDrive/Science LLM/
 
 ---
 
+## 📥 Automated PDF Downloading (`down.txt`)
+
+You can create a `down.txt` file directly inside `drive/MyDrive/Science LLM/down.txt` containing one download URL per line:
+```text
+https://arxiv.org/pdf/1706.03762.pdf
+https://openstax.org/downloads/college-physics.pdf
+https://www.ncbi.nlm.nih.gov/pmc/articles/PMC1234567/pdf/main.pdf
+```
+
+The pipeline automatically:
+1. Streams each file into `drive/MyDrive/Science LLM/Dataset/`.
+2. Validates the `%PDF` magic byte header (preventing paywall HTML pages from being saved as corrupted PDFs).
+3. Skips already downloaded files to conserve bandwidth.
+4. Records download metrics into `drive/MyDrive/Science LLM/config/data.json`.
+
+You can also run the downloader standalone:
+```bash
+python downloader.py --down_file "/content/drive/MyDrive/Science LLM/down.txt"
+```
+
+---
+
 ## 📋 State Tracking: `drive/Science LLM/config/data.json`
 
 The [`config_manager.py`](file:///d:/code/LLM/config_manager.py) module manages `data.json` with atomic writes, recording:
 - **Active Model Version**: `SCLLM-v<version>` (e.g., `SCLLM-v1.0.0`).
+- **Download Records**: Total URLs found and successfully downloaded from `down.txt`.
 - **Checkpoints & Resumption**: Latest checkpoint step, stage, directory path, and `can_resume` flag to automatically restart from the exact step if Colab times out.
 - **Training Runs**: Start/end timestamps, duration, loss, hyperparameters (batch size, learning rate, gradient accumulation).
 - **Evaluation Benchmarks**: Test prompts, domain tags, generated responses, and benchmark evaluation history.
@@ -42,6 +67,7 @@ The [`config_manager.py`](file:///d:/code/LLM/config_manager.py) module manages 
 
 ## 🛠️ Repository Files
 
+- [`downloader.py`](file:///d:/code/LLM/downloader.py): Stream downloader with URL parsing, `%PDF` verification, and duplicate skipping.
 - [`config_manager.py`](file:///d:/code/LLM/config_manager.py): Central configuration manager for paths, versions, and atomic `data.json` synchronization.
 - [`data_pipeline.py`](file:///d:/code/LLM/data_pipeline.py): Multi-column PDF parsing (PyMuPDF `fitz`), LaTeX formula preservation, reference trimming, and token chunk packing.
 - [`train_continued_pretrain.py`](file:///d:/code/LLM/train_continued_pretrain.py): Stage 1 Domain-Adaptive Continued Pre-Training with Unsloth / QLoRA 4-bit and auto-resume callback.
@@ -56,6 +82,6 @@ The [`config_manager.py`](file:///d:/code/LLM/config_manager.py) module manages 
 ## 🚀 Quickstart in Google Colab
 
 1. Open [Google Colab](https://colab.research.google.com).
-2. Upload [`Science_LLM_Colab_Master.ipynb`](file:///d:/code/LLM/Science_LLM_Colab_Master.ipynb).
+2. Upload [`Science_LLM_Colab_Master.ipynb`](file:///d:/code/LLM/Science_LLM_Colab_Master.ipynb) or open directly from GitHub: `https://colab.research.google.com/github/greencube-dev-boop/Science-LLM/blob/main/Science_LLM_Colab_Master.ipynb`.
 3. Set runtime to **GPU (T4)**.
-4. Run the notebook. Drive directories and `data.json` will be initialized automatically. If a session disconnects, re-running the training cell picks up from the latest saved checkpoint.
+4. Run all cells sequentially.
