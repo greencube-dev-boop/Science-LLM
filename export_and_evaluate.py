@@ -16,11 +16,21 @@ import re
 import time
 import torch
 import logging
+import inspect
 from typing import Optional, List, Dict
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 from datasets import load_dataset
 from config_manager import ScienceLLMConfig
+
+
+def _load_pretrained_compat(model_cls, pretrained_name_or_path, **kwargs):
+    """Load a pretrained model, handling torch_dtype -> dtype migration in transformers v5+."""
+    sig = inspect.signature(model_cls.from_pretrained)
+    valid = set(sig.parameters.keys())
+    if "torch_dtype" in kwargs and "torch_dtype" not in valid and "dtype" in valid:
+        kwargs["dtype"] = kwargs.pop("torch_dtype")
+    return model_cls.from_pretrained(pretrained_name_or_path, **kwargs)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("ExportAndEvaluate")
@@ -160,7 +170,8 @@ def merge_and_export(
     logger.info(f"Loading unquantized FP16 base model: {base_model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
 
-    base_model = AutoModelForCausalLM.from_pretrained(
+    base_model = _load_pretrained_compat(
+        AutoModelForCausalLM,
         base_model_name,
         torch_dtype=torch.float16,
         device_map="cpu",
@@ -209,7 +220,7 @@ if __name__ == "__main__":
     target_dir = config.get_model_save_dir(version=args.version)
     if target_dir.exists():
         tokenizer = AutoTokenizer.from_pretrained(str(target_dir))
-        model = AutoModelForCausalLM.from_pretrained(str(target_dir), torch_dtype=torch.float16, device_map="auto")
+        model = _load_pretrained_compat(AutoModelForCausalLM, str(target_dir), torch_dtype=torch.float16, device_map="auto")
         
         # 1. Multiple-choice Quantitative Benchmark
         accuracy = run_quantitative_sciq_benchmark(model, tokenizer, num_samples=args.sciq_samples, device=device)

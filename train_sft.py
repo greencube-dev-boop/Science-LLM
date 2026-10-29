@@ -3,6 +3,10 @@ Stage 2: Supervised Fine-Tuning (SFT) & Scientific Reasoning Alignment
 ======================================================================
 Fine-tunes the Stage 1 DAPT model into an interactive scientific reasoning assistant.
 
+Compatible with both legacy trl (<0.20) and modern trl (>=0.20) APIs:
+- Legacy: uses DataCollatorForCompletionOnlyLM + TrainingArguments
+- Modern: uses SFTConfig with assistant_only_loss=True (native completion masking)
+
 Paths:
 - Input DAPT Adapter: auto-discovered via cfg.get_stage_adapter("stage1_dapt")
 - Output SFT Checkpoints: drive/Science LLM/checkpoints/stage2_sft
@@ -12,6 +16,7 @@ Paths:
 import os
 import time
 import logging
+import inspect
 from typing import Optional
 
 # Ensure unsloth is imported first if present
@@ -29,7 +34,34 @@ from transformers import (
 )
 from peft import PeftModel, LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from datasets import load_dataset
-from trl import SFTTrainer, DataCollatorForCompletionOnlyLM
+
+# -------------------------------------------------------------------
+# Compatibility layer: detect trl API version
+# trl >= 0.20 removed DataCollatorForCompletionOnlyLM entirely;
+# use SFTConfig(assistant_only_loss=True) instead.
+# -------------------------------------------------------------------
+_USE_MODERN_TRL = False
+try:
+    from trl import SFTConfig  # available in trl >= 0.12
+    _sft_config_params = set(inspect.signature(SFTConfig.__init__).parameters.keys())
+    if "assistant_only_loss" in _sft_config_params or "completion_only_loss" in _sft_config_params:
+        _USE_MODERN_TRL = True
+except ImportError:
+    pass
+
+if _USE_MODERN_TRL:
+    from trl import SFTTrainer, SFTConfig
+    DataCollatorForCompletionOnlyLM = None  # not needed
+else:
+    from trl import SFTTrainer
+    try:
+        from trl import DataCollatorForCompletionOnlyLM
+    except ImportError:
+        try:
+            from trl.data_utils import DataCollatorForCompletionOnlyLM
+        except ImportError:
+            from trl.trainer.utils import DataCollatorForCompletionOnlyLM
+
 from config_manager import ScienceLLMConfig, create_training_args
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -62,23 +94,45 @@ class SFTCheckpointSyncCallback(TrainerCallback):
         )
 
 
-def format_chatml_prompt(example) -> str:
+def _format_chatml_messages(example) -> dict:
+    """Converts a SciQ row into a standard 'messages' list (system/user/assistant).
+
+    This format is consumed by tokenizer.apply_chat_template() in modern trl,
+    enabling reliable assistant_only_loss masking via generation markers.
+    """
+    question = example.get("question", "")
+    context = example.get("support", "")
+    answer = example.get("correct_answer", "")
+
+    user_content = f"{question}\n\nContext:\n{context}" if context else question
+    return {
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+            {"role": "assistant", "content": answer},
+        ]
+    }
+
+
+def _format_chatml_text(example) -> dict:
+    """Legacy path: renders the full ChatML string into a 'text' field."""
     question = example.get("question", "")
     context = example.get("support", "")
     answer = example.get("correct_answer", "")
 
     user_query = f"{question}\n\nContext:\n{context}" if context else question
-    return (
+    text = (
         f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
         f"<|im_start|>user\n{user_query}<|im_end|>\n"
         f"<|im_start|>assistant\n{answer}<|im_end|>"
     )
+    return {"text": text}
 
 
 def train_sft(cfg: ScienceLLMConfig, base_model_name: str = "Qwen/Qwen2.5-3B", epochs: int = 2, batch_size: int = 2, grad_accum: int = 8, lr: float = 2e-4):
     output_dir = str(cfg.checkpoints_dir / "stage2_sft")
     resume_checkpoint = cfg.get_resume_checkpoint(stage="stage2_sft")
-    
+
     # Automatically locate Stage 1 adapter (final_dapt_adapter or latest checkpoint-*)
     dapt_adapter_path = cfg.get_stage_adapter(stage="stage1_dapt")
 
@@ -121,39 +175,83 @@ def train_sft(cfg: ScienceLLMConfig, base_model_name: str = "Qwen/Qwen2.5-3B", e
 
     # Load Science Instruction Dataset
     sciq_dataset = load_dataset("sciq", split="train")
-    formatted_dataset = sciq_dataset.map(lambda ex: {"text": format_chatml_prompt(ex)})
 
-    response_template = "<|im_start|>assistant\n"
-    collator = DataCollatorForCompletionOnlyLM(response_template=response_template, tokenizer=tokenizer)
+    # ----- Branch: Modern trl (>= 0.20) vs Legacy trl -----
+    if _USE_MODERN_TRL:
+        logger.info("Using MODERN trl API (SFTConfig + assistant_only_loss)")
+        formatted_dataset = sciq_dataset.map(_format_chatml_messages, remove_columns=sciq_dataset.column_names)
 
-    training_args = create_training_args(
-        output_dir=output_dir,
-        per_device_train_batch_size=batch_size,
-        gradient_accumulation_steps=grad_accum,
-        warmup_ratio=0.05,
-        num_train_epochs=epochs,
-        learning_rate=lr,
-        fp16=True,
-        bf16=False,
-        logging_steps=10,
-        optim="paged_adamw_8bit",
-        save_strategy="steps",
-        save_steps=100,
-        save_total_limit=2,
-        lr_scheduler_type="cosine",
-        report_to="none"
-    )
+        sft_kwargs = dict(
+            output_dir=output_dir,
+            per_device_train_batch_size=batch_size,
+            gradient_accumulation_steps=grad_accum,
+            warmup_ratio=0.05,
+            num_train_epochs=epochs,
+            learning_rate=lr,
+            fp16=True,
+            bf16=False,
+            logging_steps=10,
+            optim="paged_adamw_8bit",
+            save_strategy="steps",
+            save_steps=100,
+            save_total_limit=2,
+            lr_scheduler_type="cosine",
+            report_to="none",
+            max_seq_length=2048,
+        )
+        # Use the right flag name for the installed trl version
+        if "assistant_only_loss" in _sft_config_params:
+            sft_kwargs["assistant_only_loss"] = True
+        elif "completion_only_loss" in _sft_config_params:
+            sft_kwargs["completion_only_loss"] = True
 
-    trainer = SFTTrainer(
-        model=model,
-        tokenizer=tokenizer,
-        train_dataset=formatted_dataset,
-        dataset_text_field="text",
-        data_collator=collator,
-        max_seq_length=2048,
-        args=training_args,
-        callbacks=[SFTCheckpointSyncCallback(cfg)]
-    )
+        # Filter to valid SFTConfig parameters (forward-compat safety net)
+        valid_sft_params = set(inspect.signature(SFTConfig.__init__).parameters.keys())
+        filtered_kwargs = {k: v for k, v in sft_kwargs.items() if k in valid_sft_params}
+        training_args = SFTConfig(**filtered_kwargs)
+
+        trainer = SFTTrainer(
+            model=model,
+            processing_class=tokenizer,
+            train_dataset=formatted_dataset,
+            args=training_args,
+            callbacks=[SFTCheckpointSyncCallback(cfg)]
+        )
+    else:
+        logger.info("Using LEGACY trl API (DataCollatorForCompletionOnlyLM)")
+        formatted_dataset = sciq_dataset.map(_format_chatml_text)
+
+        response_template = "<|im_start|>assistant\n"
+        collator = DataCollatorForCompletionOnlyLM(response_template=response_template, tokenizer=tokenizer)
+
+        training_args = create_training_args(
+            output_dir=output_dir,
+            per_device_train_batch_size=batch_size,
+            gradient_accumulation_steps=grad_accum,
+            warmup_ratio=0.05,
+            num_train_epochs=epochs,
+            learning_rate=lr,
+            fp16=True,
+            bf16=False,
+            logging_steps=10,
+            optim="paged_adamw_8bit",
+            save_strategy="steps",
+            save_steps=100,
+            save_total_limit=2,
+            lr_scheduler_type="cosine",
+            report_to="none"
+        )
+
+        trainer = SFTTrainer(
+            model=model,
+            tokenizer=tokenizer,
+            train_dataset=formatted_dataset,
+            dataset_text_field="text",
+            data_collator=collator,
+            max_seq_length=2048,
+            args=training_args,
+            callbacks=[SFTCheckpointSyncCallback(cfg)]
+        )
 
     start_time = time.time()
     logger.info(f"Starting Stage 2 SFT training (Resume checkpoint: {resume_checkpoint})...")
