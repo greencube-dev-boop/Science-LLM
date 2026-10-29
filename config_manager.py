@@ -94,7 +94,7 @@ class ScienceLLMConfig:
                     logger.info(f"Loaded existing state from {self.data_json_path} (Version: {state.get('current_version')})")
                     return state
             except Exception as e:
-                logger.warning(f"Could not parse existing data.json: {e}. Backing up and initializing new state.")
+                logger.warning(f"Error reading data.json: {e}. Backing up and initializing new state.")
                 backup_path = self.config_dir / f"data.json.bak.{int(time.time())}"
                 shutil.copyfile(self.data_json_path, backup_path)
 
@@ -190,6 +190,42 @@ class ScienceLLMConfig:
                 latest_disk_ck = str(checkpoints[-1])
                 logger.info(f"Discovered checkpoint on disk: {latest_disk_ck}")
                 return latest_disk_ck
+
+        return None
+
+    def get_stage_adapter(self, stage: str = "stage1_dapt") -> Optional[str]:
+        """
+        Robustly locates the best available adapter for a given stage:
+        1. Checks for final_{stage}_adapter (or final_dapt_adapter / final_sft_adapter).
+        2. Falls back to the latest checkpoint-* folder in that stage directory.
+        """
+        stage_dir = self.checkpoints_dir / stage
+        if not stage_dir.exists():
+            return None
+
+        # Check standard final save names
+        candidates = [
+            stage_dir / "final_dapt_adapter",
+            stage_dir / "final_sft_adapter",
+            stage_dir / f"final_{stage}_adapter"
+        ]
+        for c in candidates:
+            if c.exists() and any(c.iterdir()):
+                logger.info(f"Found final adapter for {stage}: {c}")
+                return str(c)
+
+        # Fall back to highest step checkpoint-*
+        checkpoints = [d for d in stage_dir.glob("checkpoint-*") if d.is_dir() and any(d.iterdir())]
+        if checkpoints:
+            def extract_step(p):
+                try:
+                    return int(p.name.split("-")[-1])
+                except ValueError:
+                    return 0
+            checkpoints.sort(key=extract_step)
+            best_ck = str(checkpoints[-1])
+            logger.info(f"Found latest step checkpoint for {stage}: {best_ck}")
+            return best_ck
 
         return None
 

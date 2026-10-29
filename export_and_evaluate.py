@@ -85,7 +85,6 @@ def run_quantitative_sciq_benchmark(model, tokenizer, num_samples: int = 50, dev
 
         gen_text = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True).strip()
 
-        # Check if the correct answer appears in generated response
         if correct_answer.lower() in gen_text.lower():
             correct += 1
 
@@ -152,9 +151,10 @@ def merge_and_export(
     save_dir = cfg.get_model_save_dir(version=current_ver)
 
     if not adapter_path:
-        sft_adapter = cfg.checkpoints_dir / "stage2_sft" / "final_sft_adapter"
-        dapt_adapter = cfg.checkpoints_dir / "stage1_dapt" / "final_dapt_adapter"
-        adapter_path = str(sft_adapter if sft_adapter.exists() else dapt_adapter)
+        # Automatically find the latest adapter (SFT preferred, otherwise DAPT)
+        sft_adapter = cfg.get_stage_adapter("stage2_sft")
+        dapt_adapter = cfg.get_stage_adapter("stage1_dapt")
+        adapter_path = str(sft_adapter if sft_adapter else dapt_adapter)
 
     logger.info(f"Target model destination: {save_dir}")
     logger.info(f"Loading unquantized FP16 base model: {base_model_name}...")

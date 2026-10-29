@@ -4,7 +4,7 @@ Stage 2: Supervised Fine-Tuning (SFT) & Scientific Reasoning Alignment
 Fine-tunes the Stage 1 DAPT model into an interactive scientific reasoning assistant.
 
 Paths:
-- Input DAPT Adapter: drive/Science LLM/checkpoints/stage1_dapt/final_dapt_adapter
+- Input DAPT Adapter: auto-discovered via cfg.get_stage_adapter("stage1_dapt")
 - Output SFT Checkpoints: drive/Science LLM/checkpoints/stage2_sft
 - State Metadata: drive/Science LLM/config/data.json
 """
@@ -78,7 +78,9 @@ def format_chatml_prompt(example) -> str:
 def train_sft(cfg: ScienceLLMConfig, base_model_name: str = "Qwen/Qwen2.5-3B", epochs: int = 2, batch_size: int = 2, grad_accum: int = 8, lr: float = 2e-4):
     output_dir = str(cfg.checkpoints_dir / "stage2_sft")
     resume_checkpoint = cfg.get_resume_checkpoint(stage="stage2_sft")
-    dapt_adapter_path = str(cfg.checkpoints_dir / "stage1_dapt" / "final_dapt_adapter")
+    
+    # Automatically locate Stage 1 adapter (final_dapt_adapter or latest checkpoint-*)
+    dapt_adapter_path = cfg.get_stage_adapter(stage="stage1_dapt")
 
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -102,14 +104,14 @@ def train_sft(cfg: ScienceLLMConfig, base_model_name: str = "Qwen/Qwen2.5-3B", e
     model = prepare_model_for_kbit_training(model)
     model.gradient_checkpointing_enable()
 
-    if os.path.exists(dapt_adapter_path):
+    if dapt_adapter_path and os.path.exists(dapt_adapter_path):
         logger.info(f"Loading Stage 1 DAPT adapter from: {dapt_adapter_path}")
         model = PeftModel.from_pretrained(model, dapt_adapter_path, is_trainable=True)
     else:
-        logger.info("Initializing fresh LoRA adapters for SFT...")
+        logger.info("No Stage 1 adapter found on disk. Initializing fresh LoRA adapters for SFT...")
         lora_config = LoraConfig(
-            r=16,
-            lora_alpha=32,
+            r=32,
+            lora_alpha=64,
             target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
             lora_dropout=0.05,
             bias="none",
